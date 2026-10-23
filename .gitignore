@@ -14,3 +14,7 @@ host/gud-module/modules.order
 __pycache__/
 *.bin
 sdkconfig.*.bak
+tools/ui_preview/obj/
+tools/ui_preview/out/
+tools/ui_preview/preview
+tools/ui_preview/preview.exe
