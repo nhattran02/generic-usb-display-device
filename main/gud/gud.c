@@ -557,12 +557,6 @@ int gud_req_set(const struct gud_display *disp, uint8_t request, uint16_t index,
     return ret;
 }
 
-void gud_write_buffer(const struct gud_display *disp, void *buf)
-{
-    if (disp->write_buffer)
-        disp->write_buffer(disp, &_set_buf, buf);
-}
-
 uint8_t gud_current_format(void)
 {
     return _state.format;
