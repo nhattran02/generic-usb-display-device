@@ -9,6 +9,7 @@ idf_component_register(
         usb_glue.c
         gud/gud.c
         gud/gud_driver.c
+        gud/gud_lz4.c
     INCLUDE_DIRS . gud
     REQUIRES esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_ledc esp_timer esp_hw_support
     PRIV_REQUIRES tinyusb esp_psram nvs_flash

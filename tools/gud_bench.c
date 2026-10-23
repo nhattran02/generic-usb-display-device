@@ -36,10 +36,12 @@
 #define GUD_PID              0x614d
 #define USB_REQ_VENDOR_STATS 0xB1
 
+/* main/gud/gud_driver.h. Version 1 (sequential firmware): t1 = decode, t2 = lcd flush.
+ * Version 2 (pipelined): t1 = render (overlaps USB), t2 = stall waiting for a free receive buffer. */
 struct __attribute__((packed)) dev_stats {
     uint32_t version;
     uint32_t rects;
-    uint64_t pixels, raw_bytes, wire_bytes, usb_us, decode_us, flush_us, uptime_us;
+    uint64_t pixels, raw_bytes, wire_bytes, usb_us, t1_us, t2_us, uptime_us;
 };
 
 static int drm_fd, usb_fd = -1;
@@ -103,7 +105,7 @@ static int get_stats(struct dev_stats *s)
         .bRequestType = 0xC0, .bRequest = USB_REQ_VENDOR_STATS,
         .wValue = 0, .wIndex = 0, .wLength = sizeof(*s), .timeout = 1000, .data = s,
     };
-    return ioctl(usb_fd, USBDEVFS_CONTROL, &ct) == (int) sizeof(*s) && s->version == 1 ? 0 : -1;
+    return ioctl(usb_fd, USBDEVFS_CONTROL, &ct) == (int) sizeof(*s) && (s->version == 1 || s->version == 2) ? 0 : -1;
 }
 
 static void dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -212,10 +214,16 @@ static void report(const char *name, int frames, double t, const struct dev_stat
     double wire = (double) (b->wire_bytes - a->wire_bytes), raw = (double) (b->raw_bytes - a->raw_bytes);
     printf(" | device %6.1f fps  %6.1f Mpx/s  USB %6.0f KB/s  LZ4 %4.1fx",
            n / t, (b->pixels - a->pixels) / t / 1e6, wire / t / 1024, wire ? raw / wire : 0.0);
-    if (n)
+    if (n && b->version == 1) {
         printf(" | per frame: usb %5.1f  decode %5.1f  lcd %5.1f ms",
-               (b->usb_us - a->usb_us) / 1e3 / n, (b->decode_us - a->decode_us) / 1e3 / n,
-               (b->flush_us - a->flush_us) / 1e3 / n);
+               (b->usb_us - a->usb_us) / 1e3 / n, (b->t1_us - a->t1_us) / 1e3 / n, (b->t2_us - a->t2_us) / 1e3 / n);
+    } else if (n) {
+        /* render runs alongside USB: busy near 100% means the panel side (LZ4 + SPI) sets the pace */
+        double busy = 100.0 * (double) (b->t1_us - a->t1_us) / (double) (b->uptime_us - a->uptime_us);
+        printf(" | per frame: usb %5.1f  render %5.1f  stall %5.1f ms | render busy %3.0f%%",
+               (b->usb_us - a->usb_us) / 1e3 / n, (b->t1_us - a->t1_us) / 1e3 / n, (b->t2_us - a->t2_us) / 1e3 / n,
+               busy);
+    }
     printf("\n");
 }
 

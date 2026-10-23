@@ -5,21 +5,29 @@
  * GUD (Generic USB Display) device side for TinyUSB on ESP32-S3 (LCDWiki ES3C28P port).
  * Derived from notro/gud-pico (driver.c), adapted to:
  *  - a composite device (vendor interface is not necessarily interface 0),
- *  - receiving rectangles straight into the shadow framebuffer when possible,
- *  - handing every finished rectangle to disp->write_buffer (SPI panel flush),
- *  - running LZ4 decompression / rect copy in task context (tud_task()),
- *  - decompressing through an internal-SRAM window (see lz4_decode_to_fb()).
+ *  - a pipeline: the USB task only receives rectangles, a render task on the other core decodes them and
+ *    streams the pixels to disp->rect_* (SPI panel), with two receive buffers so the next rectangle comes
+ *    in over USB while the current one is drawn,
+ *  - a streaming LZ4 decoder working in a 64 KB internal-SRAM ring (gud_lz4.c).
+ *
+ * Flow control: when both receive buffers are taken (drawing is slower than USB), SET_BUFFER is accepted
+ * but the bulk transfer is armed only once the render task frees a buffer; until then the controller NAKs
+ * the host's bulk OUT packets, the standard USB way to say "not yet".
  */
 #include <string.h>
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 #include "tusb.h"
 #include "device/usbd_pvt.h"
 
 #include "gud.h"
 #include "gud_driver.h"
+#include "gud_lz4.h"
 #include "usb_glue.h"
 
 static const char *TAG = "gud";
@@ -36,41 +44,73 @@ static const char *TAG = "gud";
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 
-/* LZ4 match offsets are 16-bit, so a 64 KB window holds everything a back-reference can reach */
-#define LZ4_WINDOW_MASK         (GUD_LZ4_WINDOW_SIZE - 1)
-#define LZ4_FLUSH_SIZE          (16 * 1024)
-
 typedef struct {
     uint8_t  itf_num;
     uint8_t  ep_out;
+    uint8_t  rhport;
     bool     opened;
 
+    int8_t   rx_idx;     /* receive buffer the armed bulk transfer writes into, -1 = none */
+    bool     pending;    /* SET_BUFFER accepted, bulk not armed yet (no free receive buffer) */
     uint8_t *buf;        /* where the bulk data lands */
     uint32_t xfer_len;   /* bytes on the wire (compressed_length or length) */
-    uint32_t len;        /* raw length */
     uint32_t offset;
-    bool     direct;     /* buf points into the panel framebuffer */
-    int64_t  t_armed;    /* when the bulk transfer for the current rectangle was armed */
+    int64_t  t_set;      /* SET_BUFFER received */
+    int64_t  t_armed;    /* bulk transfer armed */
     struct gud_set_buffer_req req;
 } gud_interface_t;
 
-static gud_interface_t _gud;
+/* A received rectangle waiting for the render task */
+typedef struct {
+    struct gud_set_buffer_req req;
+    uint8_t  idx;        /* receive buffer */
+    uint32_t gen;        /* _gen when it was received */
+} gud_job_t;
+
+static gud_interface_t _gud = { .rx_idx = -1 };
 
 static const struct gud_display *_display;
-static uint8_t *_rx_buf;
+static uint8_t *_rx[GUD_RX_BUFS];
 static size_t   _buf_size;
 static uint8_t *_window;
 
+static QueueHandle_t _job_q;    /* received rectangles, USB task -> render task */
+static QueueHandle_t _free_q;   /* free receive buffer indices, render task -> USB task */
+static volatile uint32_t _gen;  /* bumped by gud_driver_discard() */
+
 static uint8_t _ctrl_req_buf[GUD_CTRL_REQ_BUF_SIZE] TU_ATTR_ALIGNED(4);
 static uint8_t _status TU_ATTR_ALIGNED(4);
-static struct gud_driver_stats _stats TU_ATTR_ALIGNED(4);
 
-void gud_driver_setup(const struct gud_display *disp, void *rx_buf, size_t buf_size, void *lz4_window)
+/* Updated by both tasks; the control transfer sends a consistent copy */
+static struct gud_driver_stats _stats;
+static struct gud_driver_stats _stats_tx TU_ATTR_ALIGNED(4);
+static portMUX_TYPE _stats_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void gud_render_task(void *arg);
+
+esp_err_t gud_driver_setup(const struct gud_display *disp, void *const rx_bufs[GUD_RX_BUFS], size_t buf_size,
+                           void *lz4_window, int render_core)
 {
     _display = disp;
-    _rx_buf = rx_buf;
     _buf_size = buf_size;
     _window = lz4_window;
+
+    _job_q = xQueueCreate(GUD_RX_BUFS, sizeof(gud_job_t));
+    _free_q = xQueueCreate(GUD_RX_BUFS, sizeof(uint8_t));
+    if (!_job_q || !_free_q)
+        return ESP_ERR_NO_MEM;
+    for (uint8_t i = 0; i < GUD_RX_BUFS; i++) {
+        _rx[i] = rx_bufs[i];
+        xQueueSend(_free_q, &i, 0);
+    }
+    if (xTaskCreatePinnedToCore(gud_render_task, "gud_render", 4096, NULL, 5, NULL, render_core) != pdPASS)
+        return ESP_ERR_NO_MEM;
+    return ESP_OK;
+}
+
+void gud_driver_discard(void)
+{
+    _gen++;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -78,6 +118,7 @@ void gud_driver_setup(const struct gud_display *disp, void *rx_buf, size_t buf_s
 static void gud_driver_init(void)
 {
     memset(&_gud, 0, sizeof(_gud));
+    _gud.rx_idx = -1;
 }
 
 static bool gud_driver_deinit(void)
@@ -85,10 +126,22 @@ static bool gud_driver_deinit(void)
     return true;
 }
 
+/* Hand an unused receive buffer back (USB task) */
+static void gud_release_rx(void)
+{
+    if (_gud.rx_idx >= 0) {
+        uint8_t idx = (uint8_t) _gud.rx_idx;
+        _gud.rx_idx = -1;
+        xQueueSend(_free_q, &idx, 0);
+    }
+}
+
 static void gud_driver_reset(uint8_t rhport)
 {
     (void) rhport;
     _gud.opened = false;
+    _gud.pending = false;
+    gud_release_rx();       /* the bus reset aborted the transfer */
     _status = 0;
 }
 
@@ -106,21 +159,21 @@ static uint16_t gud_driver_open(uint8_t rhport, tusb_desc_interface_t const *itf
 
     _gud.ep_out = desc_ep->bEndpointAddress;
     _gud.itf_num = itf_desc->bInterfaceNumber;
+    _gud.rhport = rhport;
     _gud.opened = true;
 
     ESP_EARLY_LOGI(TAG, "GUD interface %u opened, EP OUT 0x%02x", _gud.itf_num, _gud.ep_out);
     return drv_len;
 }
 
-static bool gud_bulk_xfer(uint8_t rhport, uint8_t *buf, uint32_t xfer_len, uint32_t len)
+static bool gud_bulk_xfer(uint8_t rhport, uint8_t *buf, uint32_t xfer_len)
 {
     TU_ASSERT(!usbd_edpt_busy(rhport, _gud.ep_out));
 
     if (buf) {
-        TU_ASSERT(xfer_len && len);
+        TU_ASSERT(xfer_len);
         _gud.offset = 0;
         _gud.buf = buf;
-        _gud.len = len;
         _gud.xfer_len = xfer_len;
     } else {
         _gud.offset += GUD_EDPT_XFER_MAX_SIZE;
@@ -132,6 +185,38 @@ static bool gud_bulk_xfer(uint8_t rhport, uint8_t *buf, uint32_t xfer_len, uint3
         xfer_len = GUD_EDPT_XFER_MAX_SIZE;
 
     return usbd_edpt_xfer(rhport, _gud.ep_out, buf, (uint16_t) xfer_len, false);
+}
+
+/* Arm the bulk transfer of the accepted SET_BUFFER into receive buffer idx (USB task) */
+static bool gud_arm(uint8_t idx)
+{
+    const struct gud_set_buffer_req *r = &_gud.req;
+
+    _gud.rx_idx = (int8_t) idx;
+    _gud.t_armed = esp_timer_get_time();
+    if (!gud_bulk_xfer(_gud.rhport, _rx[idx], r->compression ? r->compressed_length : r->length)) {
+        gud_release_rx();
+        return false;
+    }
+    taskENTER_CRITICAL(&_stats_lock);
+    _stats.stall_us += (uint64_t) (_gud.t_armed - _gud.t_set);
+    taskEXIT_CRITICAL(&_stats_lock);
+    return true;
+}
+
+/* Deferred into the USB task by the render task after it freed a receive buffer */
+static void gud_try_arm(void *param)
+{
+    (void) param;
+    uint8_t idx;
+
+    if (!_gud.opened || !_gud.pending || _gud.rx_idx >= 0)
+        return;
+    if (xQueueReceive(_free_q, &idx, 0) != pdTRUE)
+        return;
+    _gud.pending = false;
+    if (!gud_arm(idx))
+        ESP_LOGW(TAG, "can't arm bulk OUT");
 }
 
 /* Control SETUP stage (called from tud_task) */
@@ -173,6 +258,7 @@ static bool gud_control_request(uint8_t rhport, tusb_control_request_t const *re
 /* Control DATA stage complete (OUT requests with payload) */
 static bool gud_control_complete(uint8_t rhport, tusb_control_request_t const *req)
 {
+    (void) rhport;
     if (req->bmRequestType_bit.direction != TUSB_DIR_OUT)
         return true;
 
@@ -185,27 +271,30 @@ static bool gud_control_complete(uint8_t rhport, tusb_control_request_t const *r
 
     if (req->bRequest == GUD_REQ_SET_BUFFER) {
         const struct gud_set_buffer_req *r = (const struct gud_set_buffer_req *) _ctrl_req_buf;
-        const uint32_t stride = _display->width * 2; /* RGB565 only */
 
-        _gud.req = *r;
-
-        if (gud_current_format() != GUD_PIXEL_FORMAT_RGB565 || !_display->fb || r->length > _buf_size ||
+        if (gud_current_format() != GUD_PIXEL_FORMAT_RGB565 || r->length > _buf_size ||
             (r->compression && (r->compressed_length > _buf_size || !_window))) {
             _status = GUD_STATUS_INVALID_PARAMETER;
             return false;
         }
-
-        /* Uncompressed full-width rectangles are contiguous in the framebuffer: receive in place */
-        _gud.direct = !r->compression && r->x == 0 && r->width == _display->width;
-
-        uint8_t *rx = _gud.direct ? _display->fb + (size_t) r->y * stride : _rx_buf;
-        uint32_t xfer_len = r->compression ? r->compressed_length : r->length;
-
-        _gud.t_armed = esp_timer_get_time();
-
-        if (!gud_bulk_xfer(rhport, rx, xfer_len, r->length)) {
+        /* The previous rectangle's bulk transfer is still armed (the host gave up on it) */
+        if (_gud.rx_idx >= 0) {
             _status = GUD_STATUS_BUSY;
             return false;
+        }
+
+        _gud.req = *r;
+        _gud.t_set = esp_timer_get_time();
+
+        uint8_t idx;
+        if (xQueueReceive(_free_q, &idx, 0) == pdTRUE) {
+            _gud.pending = false;
+            if (!gud_arm(idx)) {
+                _status = GUD_STATUS_BUSY;
+                return false;
+            }
+        } else {
+            _gud.pending = true;        /* gud_try_arm() arms it once a buffer is free */
         }
     }
     return true;
@@ -219,9 +308,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         if (req->bRequest == USB_REQ_VENDOR_STATS && req->bmRequestType_bit.direction == TUSB_DIR_IN) {
             if (stage != CONTROL_STAGE_SETUP)
                 return true;
-            _stats.version = GUD_DRIVER_STATS_VERSION;
-            _stats.uptime_us = (uint64_t) esp_timer_get_time();
-            return tud_control_xfer(rhport, req, &_stats, min(req->wLength, sizeof(_stats)));
+            taskENTER_CRITICAL(&_stats_lock);
+            _stats_tx = _stats;
+            taskEXIT_CRITICAL(&_stats_lock);
+            _stats_tx.version = GUD_DRIVER_STATS_VERSION;
+            _stats_tx.uptime_us = (uint64_t) esp_timer_get_time();
+            return tud_control_xfer(rhport, req, &_stats_tx, min(req->wLength, sizeof(_stats_tx)));
         }
         if (req->bRequest != USB_REQ_VENDOR_REBOOT || req->bmRequestType_bit.direction != TUSB_DIR_OUT)
             return false;
@@ -245,158 +337,90 @@ static bool gud_class_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_contro
     return false;
 }
 
-/* ---------------------- raw rectangle data -> framebuffer ------------------- */
-
-static struct {
-    uint8_t *row;        /* framebuffer address of the current rectangle row */
-    uint32_t row_bytes;
-    uint32_t col;        /* bytes already written into the current row */
-    uint32_t stride;
-} _sink;
-
-static void sink_begin(const struct gud_set_buffer_req *r)
-{
-    _sink.stride = _display->width * 2;
-    _sink.row = _display->fb + (size_t) r->y * _sink.stride + (size_t) r->x * 2;
-    _sink.row_bytes = r->width * 2;
-    _sink.col = 0;
-}
-
-/* Append raw pixel bytes; consecutive calls continue where the previous one stopped */
-static void sink_write(const uint8_t *src, uint32_t n)
-{
-    while (n) {
-        uint32_t c = min(n, _sink.row_bytes - _sink.col);
-        memcpy(_sink.row + _sink.col, src, c);
-        _sink.col += c;
-        src += c;
-        n -= c;
-        if (_sink.col == _sink.row_bytes) {
-            _sink.col = 0;
-            _sink.row += _sink.stride;
-        }
-    }
-}
-
-/* ------------------------- streaming LZ4 block decoder ---------------------- */
-
-/*
- * Decoding straight into the PSRAM framebuffer would make every back-reference a random PSRAM read.
- * Here the output goes through a 64 KB ring in internal SRAM; back-references are served from it and
- * the framebuffer only sees sequential writes, LZ4_FLUSH_SIZE bytes at a time.
- */
-static uint32_t _wpos, _wflushed;
-
-static void win_flush(void)
-{
-    while (_wflushed != _wpos) {
-        uint32_t start = _wflushed & LZ4_WINDOW_MASK;
-        uint32_t n = min(_wpos - _wflushed, GUD_LZ4_WINDOW_SIZE - start);
-        sink_write(_window + start, n);
-        _wflushed += n;
-    }
-}
-
-static inline void win_put(uint8_t b)
-{
-    _window[_wpos & LZ4_WINDOW_MASK] = b;
-    if (++_wpos - _wflushed >= LZ4_FLUSH_SIZE)
-        win_flush();
-}
-
-static inline bool lz4_read_len(const uint8_t **ip, const uint8_t *iend, uint32_t *len)
-{
-    uint8_t b;
-    do {
-        if (*ip >= iend)
-            return false;
-        b = *(*ip)++;
-        *len += b;
-    } while (b == 255);
-    return true;
-}
-
-static bool lz4_decode_to_fb(const uint8_t *src, uint32_t src_len, uint32_t out_len)
-{
-    const uint8_t *ip = src, *iend = src + src_len;
-
-    _wpos = _wflushed = 0;
-    while (ip < iend) {
-        uint8_t token = *ip++;
-
-        uint32_t lit = token >> 4;
-        if (lit == 15 && !lz4_read_len(&ip, iend, &lit))
-            return false;
-        if ((uint32_t) (iend - ip) < lit || _wpos + lit > out_len)
-            return false;
-        while (lit--)
-            win_put(*ip++);
-
-        if (ip == iend)
-            break;          /* the last sequence has literals only */
-
-        if (iend - ip < 2)
-            return false;
-        uint32_t off = ip[0] | ((uint32_t) ip[1] << 8);
-        ip += 2;
-        if (!off || off > _wpos)
-            return false;
-
-        uint32_t mlen = token & 15;
-        if (mlen == 15 && !lz4_read_len(&ip, iend, &mlen))
-            return false;
-        mlen += 4;
-        if (_wpos + mlen > out_len)
-            return false;
-        while (mlen--)
-            win_put(_window[(_wpos - off) & LZ4_WINDOW_MASK]);
-    }
-    win_flush();
-    return _wpos == out_len;
-}
-
+/* Bulk OUT chunk received (USB task): re-arm for the next chunk, or hand the rectangle to the render task */
 static bool gud_class_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
 {
     (void) ep_addr;
-    TU_VERIFY(result == XFER_RESULT_SUCCESS);
+
+    if (result != XFER_RESULT_SUCCESS || _gud.rx_idx < 0) {
+        gud_release_rx();
+        return false;
+    }
 
     if (xferred_bytes != (_gud.xfer_len - _gud.offset)) {
         if (xferred_bytes != GUD_EDPT_XFER_MAX_SIZE) {
             /* short transfer: host sent less than announced */
-            ESP_EARLY_LOGW(TAG, "short bulk: got %u, expected %u", (unsigned) xferred_bytes,
-                           (unsigned) (_gud.xfer_len - _gud.offset));
+            ESP_LOGW(TAG, "short bulk: got %u, expected %u", (unsigned) xferred_bytes,
+                     (unsigned) (_gud.xfer_len - _gud.offset));
+            gud_release_rx();
             return false;
         }
-        return gud_bulk_xfer(rhport, NULL, 0, 0);
+        return gud_bulk_xfer(rhport, NULL, 0);
     }
 
-    int64_t t0 = esp_timer_get_time();
-    _stats.usb_us += (uint64_t) (t0 - _gud.t_armed);
-
-    if (!_gud.direct) {
-        sink_begin(&_gud.req);
-        if (!_gud.req.compression) {
-            sink_write(_gud.buf, _gud.len);
-        } else if (!lz4_decode_to_fb(_gud.buf, _gud.xfer_len, _gud.len)) {
-            ESP_EARLY_LOGW(TAG, "LZ4 failed: xfer=%u len=%u", (unsigned) _gud.xfer_len, (unsigned) _gud.len);
-            return false;
-        }
-    }
-
-    int64_t t1 = esp_timer_get_time();
-
-    /* The rectangle is complete in ->fb: SPI panels push it to the glass from here */
-    if (_display->write_buffer)
-        _display->write_buffer(_display, &_gud.req, _display->fb);
-
-    _stats.rects++;
-    _stats.pixels += (uint64_t) _gud.req.width * _gud.req.height;
-    _stats.raw_bytes += _gud.len;
+    taskENTER_CRITICAL(&_stats_lock);
+    _stats.usb_us += (uint64_t) (esp_timer_get_time() - _gud.t_armed);
     _stats.wire_bytes += _gud.xfer_len;
-    _stats.decode_us += (uint64_t) (t1 - t0);
-    _stats.flush_us += (uint64_t) (esp_timer_get_time() - t1);
+    taskEXIT_CRITICAL(&_stats_lock);
+
+    gud_job_t job = { .req = _gud.req, .idx = (uint8_t) _gud.rx_idx, .gen = _gen };
+    _gud.rx_idx = -1;
+    xQueueSend(_job_q, &job, 0);    /* never full: one job per receive buffer */
     return true;
 }
+
+/* ------------------------------ render task ------------------------------- */
+
+static void lz4_sink(void *ctx, const void *data, size_t len)
+{
+    (void) ctx;
+    _display->rect_write(_display, data, len);
+}
+
+static void gud_render(const gud_job_t *job)
+{
+    const struct gud_set_buffer_req *r = &job->req;
+    const uint8_t *buf = _rx[job->idx];
+    uint32_t decoded;
+
+    _display->rect_begin(_display, r);
+    /* rect_begin() serialises with the firmware's own screens: checked after it, a discarded picture can't
+     * slip in after "<NO SIGNAL>" */
+    if (job->gen == _gen) {
+        if (!r->compression)
+            _display->rect_write(_display, buf, r->length);
+        else if (!gud_lz4_decode(buf, r->compressed_length, r->length, _window, lz4_sink, NULL, &decoded))
+            ESP_LOGW(TAG, "LZ4 failed: %u -> %u bytes, decoded %u", (unsigned) r->compressed_length,
+                     (unsigned) r->length, (unsigned) decoded);
+    }
+    _display->rect_end(_display);
+}
+
+static void gud_render_task(void *arg)
+{
+    (void) arg;
+    gud_job_t job;
+
+    for (;;) {
+        xQueueReceive(_job_q, &job, portMAX_DELAY);
+
+        int64_t t0 = esp_timer_get_time();
+        gud_render(&job);
+        int64_t t1 = esp_timer_get_time();
+
+        taskENTER_CRITICAL(&_stats_lock);
+        _stats.rects++;
+        _stats.pixels += (uint64_t) job.req.width * job.req.height;
+        _stats.raw_bytes += job.req.length;
+        _stats.render_us += (uint64_t) (t1 - t0);
+        taskEXIT_CRITICAL(&_stats_lock);
+
+        xQueueSend(_free_q, &job.idx, 0);
+        usbd_defer_func(gud_try_arm, NULL, false);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 
 static usbd_class_driver_t const _gud_class_driver[] = {
     {

@@ -171,6 +171,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 /* Host deconfigured the device (disconnect, host reboot, bus reset) */
 void tud_umount_cb(void)
 {
+    gud_driver_discard();
     screen_signal_lost();
 }
 
