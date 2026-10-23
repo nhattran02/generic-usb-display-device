@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="370" viewBox="0 0 760 370" role="img" aria-label="Frames per second, v1 vs v2">
+<style>
+  .bg{fill:#fcfcfb} .ink{fill:#0b0b0b} .ink2{fill:#52514e} .mut{fill:#898781}
+  .grid{stroke:#e1e0d9} .base{stroke:#c3c2b7} .s1{fill:#2a78d6} .s0{fill:#b9b7b0}
+  .box{fill:#ffffff;stroke:#c3c2b7} .accent{fill:#e8f1fc;stroke:#2a78d6} .line{stroke:#52514e}
+  .aline{stroke:#2a78d6} .tline{stroke:#898781} .ahead{fill:#2a78d6} .thead{fill:#898781}
+  text{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  @media (prefers-color-scheme: dark){
+    .bg{fill:#1a1a19} .ink{fill:#f0efec} .ink2{fill:#c3c2b7}
+    .grid{stroke:#2c2c2a} .base{stroke:#383835} .s1{fill:#3987e5} .s0{fill:#5c5b57}
+    .box{fill:#232322;stroke:#4a4a47} .accent{fill:#1d2a3a;stroke:#3987e5} .line{stroke:#c3c2b7}
+    .aline{stroke:#3987e5} .ahead{fill:#3987e5}
+  }
+</style>
+<rect class="bg" width="760" height="370" rx="8"/>
+<text class="ink" x="20" y="30" font-size="16" font-weight="600">Frames per second drawn by the display</text>
+<rect class="s0" x="170" y="44" width="12" height="12" rx="2"/>
+<text class="ink2" x="188" y="54" font-size="12">v1: sequential</text>
+<rect class="s1" x="300" y="44" width="12" height="12" rx="2"/>
+<text class="ink2" x="318" y="54" font-size="12">v2: pipelined (current)</text>
+<line class="grid" x1="170.0" y1="64" x2="170.0" y2="330" stroke-width="1"/>
+<text class="mut" x="170.0" y="348" font-size="11" text-anchor="middle">0</text>
+<line class="grid" x1="300.0" y1="64" x2="300.0" y2="330" stroke-width="1"/>
+<text class="mut" x="300.0" y="348" font-size="11" text-anchor="middle">25</text>
+<line class="grid" x1="430.0" y1="64" x2="430.0" y2="330" stroke-width="1"/>
+<text class="mut" x="430.0" y="348" font-size="11" text-anchor="middle">50</text>
+<line class="grid" x1="560.0" y1="64" x2="560.0" y2="330" stroke-width="1"/>
+<text class="mut" x="560.0" y="348" font-size="11" text-anchor="middle">75</text>
+<line class="grid" x1="690.0" y1="64" x2="690.0" y2="330" stroke-width="1"/>
+<text class="mut" x="690.0" y="348" font-size="11" text-anchor="middle">100</text>
+<text class="mut" x="430.0" y="364" font-size="11" text-anchor="middle">fps</text>
+<text class="ink" x="158" y="89.0" font-size="13" text-anchor="end">Solid colour</text>
+<text class="mut" x="158" y="104.0" font-size="11" text-anchor="end">full screen</text>
+<path class="s0" d="M170,77.0 H254.39999999999998 Q258.4,77.0 258.4,81.0 V87.0 Q258.4,91.0 254.39999999999998,91.0 H170 Z"/>
+<text class="ink2" x="264.4" y="88.0" font-size="11">17</text>
+<path class="s1" d="M170,93.0 H324.08 Q328.08,93.0 328.08,97.0 V103.0 Q328.08,107.0 324.08,107.0 H170 Z"/>
+<text class="ink" x="334.08" y="104.0" font-size="11" font-weight="600">30.4</text>
+<text class="ink" x="158" y="141.0" font-size="13" text-anchor="end">Scrolling UI</text>
+<text class="mut" x="158" y="156.0" font-size="11" text-anchor="end">full screen</text>
+<path class="s0" d="M170,129.0 H254.39999999999998 Q258.4,129.0 258.4,133.0 V139.0 Q258.4,143.0 254.39999999999998,143.0 H170 Z"/>
+<text class="ink2" x="264.4" y="140.0" font-size="11">17</text>
+<path class="s1" d="M170,145.0 H324.08 Q328.08,145.0 328.08,149.0 V155.0 Q328.08,159.0 324.08,159.0 H170 Z"/>
+<text class="ink" x="334.08" y="156.0" font-size="11" font-weight="600">30.4</text>
+<text class="ink" x="158" y="193.0" font-size="13" text-anchor="end">Gradient</text>
+<text class="mut" x="158" y="208.0" font-size="11" text-anchor="end">full screen</text>
+<path class="s0" d="M170,181.0 H218.51999999999998 Q222.51999999999998,181.0 222.51999999999998,185.0 V191.0 Q222.51999999999998,195.0 218.51999999999998,195.0 H170 Z"/>
+<text class="ink2" x="228.51999999999998" y="192.0" font-size="11">10.1</text>
+<path class="s1" d="M170,197.0 H253.36 Q257.36,197.0 257.36,201.0 V207.0 Q257.36,211.0 253.36,211.0 H170 Z"/>
+<text class="ink" x="263.36" y="208.0" font-size="11" font-weight="600">16.8</text>
+<text class="ink" x="158" y="245.0" font-size="13" text-anchor="end">Noise</text>
+<text class="mut" x="158" y="260.0" font-size="11" text-anchor="end">incompressible</text>
+<path class="s0" d="M170,233.0 H192.0 Q196.0,233.0 196.0,237.0 V243.0 Q196.0,247.0 192.0,247.0 H170 Z"/>
+<text class="ink2" x="202.0" y="244.0" font-size="11">5</text>
+<path class="s1" d="M170,249.0 H192.0 Q196.0,249.0 196.0,253.0 V259.0 Q196.0,263.0 192.0,263.0 H170 Z"/>
+<text class="ink" x="202.0" y="260.0" font-size="11" font-weight="600">5</text>
+<text class="ink" x="158" y="297.0" font-size="13" text-anchor="end">40×40 square</text>
+<text class="mut" x="158" y="312.0" font-size="11" text-anchor="end">partial update</text>
+<path class="s0" d="M170,285.0 H644.92 Q648.92,285.0 648.92,289.0 V295.0 Q648.92,299.0 644.92,299.0 H170 Z"/>
+<text class="ink2" x="654.92" y="296.0" font-size="11">92.1</text>
+<path class="s1" d="M170,301.0 H631.4000000000001 Q635.4000000000001,301.0 635.4000000000001,305.0 V311.0 Q635.4000000000001,315.0 631.4000000000001,315.0 H170 Z"/>
+<text class="ink" x="641.4000000000001" y="312.0" font-size="11" font-weight="600">89.5</text>
+<line class="base" x1="170" y1="64" x2="170" y2="330" stroke-width="1"/>
+</svg>
