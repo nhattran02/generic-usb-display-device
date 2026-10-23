@@ -1,5 +1,25 @@
 # gud-es3c28p
 
+<p align="center">
+  <img src="docs/images/photo-video.jpg" width="760" alt="The ES3C28P playing a video sent from a Linux host over USB">
+</p>
+
+<p align="center">
+  <b>A 2.8" ESP32-S3 board as a plug-and-play USB touchscreen for Linux.</b><br>
+  320 × 240 · 30 fps UI · LZ4 over USB · capacitive touch · nothing to install on the host
+</p>
+
+<table align="center">
+  <tr>
+    <td><img src="docs/images/photo-colorbars.jpg" width="380" alt="Colour bars drawn by tools/gud_test"></td>
+    <td><img src="docs/images/photo-nosignal.jpg" width="380" alt="The NO SIGNAL screen shown before the host draws"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Colour bars from <code>tools/gud_test</code></sub></td>
+    <td align="center"><sub>Waiting for the host</sub></td>
+  </tr>
+</table>
+
 Turns the **LCDWiki ES3C28P** (2.8" ESP32-S3 board) into a plug-and-play USB touchscreen for Linux.
 Plug it in, and the kernel sees a normal display (`gud` driver) and a normal touchscreen
 (`hid-multitouch`). No custom host driver, no daemon.
