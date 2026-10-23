@@ -50,6 +50,7 @@ typedef struct {
     uint32_t len;        /* raw length */
     uint32_t offset;
     bool     direct;     /* buf points into the panel framebuffer */
+    int64_t  t_armed;    /* when the bulk transfer for the current rectangle was armed */
     struct gud_set_buffer_req req;
 } gud_interface_t;
 
@@ -62,6 +63,7 @@ static uint8_t *_window;
 
 static uint8_t _ctrl_req_buf[GUD_CTRL_REQ_BUF_SIZE] TU_ATTR_ALIGNED(4);
 static uint8_t _status TU_ATTR_ALIGNED(4);
+static struct gud_driver_stats _stats TU_ATTR_ALIGNED(4);
 
 void gud_driver_setup(const struct gud_display *disp, void *rx_buf, size_t buf_size, void *lz4_window)
 {
@@ -199,6 +201,8 @@ static bool gud_control_complete(uint8_t rhport, tusb_control_request_t const *r
         uint8_t *rx = _gud.direct ? _display->fb + (size_t) r->y * stride : _rx_buf;
         uint32_t xfer_len = r->compression ? r->compressed_length : r->length;
 
+        _gud.t_armed = esp_timer_get_time();
+
         if (!gud_bulk_xfer(rhport, rx, xfer_len, r->length)) {
             _status = GUD_STATUS_BUSY;
             return false;
@@ -209,8 +213,16 @@ static bool gud_control_complete(uint8_t rhport, tusb_control_request_t const *r
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req)
 {
-    /* Device-recipient vendor request (outside GUD): reboot into the bootloader's USB download window */
+    /* Device-recipient vendor requests (outside GUD): reboot into the bootloader's USB download window,
+     * performance counters for tools/gud_bench.c */
     if (req->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE) {
+        if (req->bRequest == USB_REQ_VENDOR_STATS && req->bmRequestType_bit.direction == TUSB_DIR_IN) {
+            if (stage != CONTROL_STAGE_SETUP)
+                return true;
+            _stats.version = GUD_DRIVER_STATS_VERSION;
+            _stats.uptime_us = (uint64_t) esp_timer_get_time();
+            return tud_control_xfer(rhport, req, &_stats, min(req->wLength, sizeof(_stats)));
+        }
         if (req->bRequest != USB_REQ_VENDOR_REBOOT || req->bmRequestType_bit.direction != TUSB_DIR_OUT)
             return false;
         if (stage == CONTROL_STAGE_SETUP)
@@ -358,6 +370,9 @@ static bool gud_class_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t res
         return gud_bulk_xfer(rhport, NULL, 0, 0);
     }
 
+    int64_t t0 = esp_timer_get_time();
+    _stats.usb_us += (uint64_t) (t0 - _gud.t_armed);
+
     if (!_gud.direct) {
         sink_begin(&_gud.req);
         if (!_gud.req.compression) {
@@ -368,9 +383,18 @@ static bool gud_class_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t res
         }
     }
 
+    int64_t t1 = esp_timer_get_time();
+
     /* The rectangle is complete in ->fb: SPI panels push it to the glass from here */
     if (_display->write_buffer)
         _display->write_buffer(_display, &_gud.req, _display->fb);
+
+    _stats.rects++;
+    _stats.pixels += (uint64_t) _gud.req.width * _gud.req.height;
+    _stats.raw_bytes += _gud.len;
+    _stats.wire_bytes += _gud.xfer_len;
+    _stats.decode_us += (uint64_t) (t1 - t0);
+    _stats.flush_us += (uint64_t) (esp_timer_get_time() - t1);
     return true;
 }
 
