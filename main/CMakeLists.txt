@@ -16,7 +16,9 @@ idf_component_register(
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=format -Wno-unused-function)
 
-# idf.py -DBOARD_LCD_ROTATION=0 build  (see BOARD_LCD_ROTATION in board.h)
-if(DEFINED BOARD_LCD_ROTATION)
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE BOARD_LCD_ROTATION=${BOARD_LCD_ROTATION})
-endif()
+# idf.py -DBOARD_LCD_ROTATION=0 -DBOARD_LCD_SPI_HZ=40000000 build  (see board.h)
+foreach(opt BOARD_LCD_ROTATION BOARD_LCD_SPI_HZ)
+    if(DEFINED ${opt})
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ${opt}=${${opt}})
+    endif()
+endforeach()

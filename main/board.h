@@ -19,8 +19,13 @@
 #define BOARD_LCD_SCK        12
 #define BOARD_LCD_MOSI       11
 #define BOARD_LCD_MISO       13
-/* GPIO10..13 are the FSPI IO_MUX pins, so 80 MHz works electrically; 40 MHz is safe for every ILI9341 */
+/*
+ * 40 MHz: a full frame in ~31 ms. The ESP32-S3 side (FSPI IO_MUX pins) could do 80 MHz, but the ES3C28P
+ * panel garbles the picture there (verified); the 80 MHz SPI clock has no step in between.
+ */
+#ifndef BOARD_LCD_SPI_HZ
 #define BOARD_LCD_SPI_HZ     (40 * 1000 * 1000)
+#endif
 
 /* Native panel size (portrait) */
 #define BOARD_PANEL_W        240
