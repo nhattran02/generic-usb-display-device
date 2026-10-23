@@ -5,14 +5,21 @@ idf_component_register(
         lcd.c
         touch.c
         screen.c
-        ui.c
+        settings.c
         usb_glue.c
         gud/gud.c
         gud/gud_driver.c
         gud/gud_lz4.c
-    INCLUDE_DIRS . gud
+        ui/ui_port.c
+        ui/ui_platform_esp.c
+        ui/ui_app.c
+        ui/ui_pages.c
+        ui/ui_monitor.c
+        ui/ui_wave.c
+        ui/ui_vitals.c
+    INCLUDE_DIRS . gud ui
     REQUIRES esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_ledc esp_timer esp_hw_support
-    PRIV_REQUIRES tinyusb esp_psram nvs_flash
+    PRIV_REQUIRES tinyusb esp_psram nvs_flash esp_driver_tsens esp_app_format
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=format -Wno-unused-function)
 

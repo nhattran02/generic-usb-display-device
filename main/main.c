@@ -11,8 +11,6 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -21,6 +19,8 @@
 #include "touch.h"
 #include "usb_glue.h"
 #include "screen.h"
+#include "settings.h"
+#include "ui_port.h"
 #include "gud.h"
 #include "gud_driver.h"
 
@@ -65,7 +65,7 @@ static int controller_enable(const struct gud_display *disp, uint8_t enable)
 {
     (void) disp;
     if (!enable) {
-        gud_driver_discard();               /* pictures still queued must not land on "<NO SIGNAL>" */
+        gud_driver_discard();               /* pictures still queued must not land on the standalone UI */
         screen_signal_lost();
     }
     return 0;
@@ -77,61 +77,10 @@ static struct gud_property_req s_connector_props[] = {
     { .prop = GUD_PROPERTY_BACKLIGHT_BRIGHTNESS, .val = BOARD_BL_DEFAULT_PERCENT },
 };
 
-/*
- * Brightness is kept in NVS. A slider drag sends many commits, so it is written once the value has been
- * stable for BL_SAVE_DELAY_MS (NVS also skips writes of an unchanged value). 0 is not stored: it means
- * "off", and booting dark would hide "<NO SIGNAL>"; the last non-zero level is kept instead.
- */
-#define BL_NVS_NAMESPACE   "display"
-#define BL_NVS_KEY         "brightness"
-#define BL_SAVE_DELAY_MS   2000
-
-static esp_timer_handle_t s_bl_save_timer;
-static uint8_t s_bl_saved_level = BOARD_BL_DEFAULT_PERCENT;
-
-static uint8_t bl_load(void)
+/* The standalone UI changed the brightness: keep what the host reads in step */
+static void brightness_changed(uint8_t level)
 {
-    nvs_handle_t h;
-    uint8_t v = BOARD_BL_DEFAULT_PERCENT;
-
-    if (nvs_open(BL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, BL_NVS_KEY, &v);
-        nvs_close(h);
-    }
-    return (v >= 1 && v <= 100) ? v : BOARD_BL_DEFAULT_PERCENT;
-}
-
-static void bl_save_cb(void *arg)
-{
-    (void) arg;
-    nvs_handle_t h;
-
-    if (nvs_open(BL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK)
-        return;
-    if (nvs_set_u8(h, BL_NVS_KEY, s_bl_saved_level) == ESP_OK)
-        nvs_commit(h);
-    nvs_close(h);
-    ESP_LOGI(TAG, "brightness %u%% saved", s_bl_saved_level);
-}
-
-static void bl_init(void)
-{
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err == ESP_OK)
-        s_bl_saved_level = bl_load();
-    else
-        ESP_LOGW(TAG, "NVS unavailable (%s), brightness won't be saved", esp_err_to_name(err));
-
-    const esp_timer_create_args_t args = { .callback = bl_save_cb, .name = "bl_save" };
-    if (err == ESP_OK)
-        ESP_ERROR_CHECK(esp_timer_create(&args, &s_bl_save_timer));
-
-    s_connector_props[0].val = s_bl_saved_level;
-    board_backlight_brightness(s_bl_saved_level);
+    s_connector_props[0].val = level;
 }
 #endif
 
@@ -142,14 +91,8 @@ static int state_commit(const struct gud_display *disp, const struct gud_state_r
 #if BOARD_BL_PWM_GPIO >= 0
     for (unsigned i = 0; i < num_properties; i++) {
         if (state->properties[i].prop == GUD_PROPERTY_BACKLIGHT_BRIGHTNESS && state->properties[i].val <= 100) {
-            uint8_t level = (uint8_t) state->properties[i].val;
-            s_connector_props[0].val = level;
-            board_backlight_brightness(level);
-            if (level && level != s_bl_saved_level && s_bl_save_timer) {
-                s_bl_saved_level = level;
-                esp_timer_stop(s_bl_save_timer);
-                esp_timer_start_once(s_bl_save_timer, BL_SAVE_DELAY_MS * 1000);
-            }
+            s_connector_props[0].val = state->properties[i].val;
+            settings_set_brightness((uint8_t) state->properties[i].val, true);
         }
     }
 #else
@@ -214,19 +157,29 @@ static struct gud_display s_display = {
 #endif
 };
 
+/* Touch goes to whoever owns the panel: the standalone UI, or the host as HID reports */
+static void touch_route(const touch_point_t *pts, int n)
+{
+    if (screen_is_local())
+        ui_port_touch(pts, n);
+    else
+        usb_glue_touch(pts, n);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "GUD display firmware starting");
 
     ESP_ERROR_CHECK(board_init());          /* I2C bus, backlight PWM (dark) */
-    ESP_ERROR_CHECK(lcd_init());            /* ILI9341 over SPI, framebuffer for the firmware's own screens */
+    ESP_ERROR_CHECK(lcd_init());            /* ILI9341 over SPI, GRAM cleared */
+    settings_init();                        /* saved brightness and screen timeout (NVS) */
 #if BOARD_BL_PWM_GPIO >= 0
-    bl_init();                              /* saved brightness, before the backlight first comes on */
+    s_connector_props[0].val = settings_brightness();
+    settings_on_brightness(brightness_changed);
 #endif
-    screen_init();                          /* "<NO SIGNAL>" until the host sends a picture, sleep after 60 s */
 
     /* Bulk data is written to the receive buffers at USB speed (~1 MB/s), so PSRAM is fine; LZ4 back-references
-     * are served from an internal-SRAM window (see gud_driver.c) */
+     * are served from an internal-SRAM window (see gud_driver.c). Allocated before the UI takes its share. */
     void *rx[GUD_RX_BUFS];
     for (int i = 0; i < GUD_RX_BUFS; i++)
         rx[i] = heap_caps_malloc(FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -235,11 +188,13 @@ void app_main(void)
         ESP_LOGE(TAG, "out of memory for GUD buffers");
         abort();
     }
-    /* Render task on core 0, next to nothing busy; the USB stack runs on core 1 */
+    /* Render task on core 0, next to the UI task (parked while the host draws); the USB stack runs on core 1 */
     ESP_ERROR_CHECK(gud_driver_setup(&s_display, rx, FB_BYTES, window, 0));
 
+    screen_init();                          /* standalone UI until the host sends a picture */
+
     if (touch_init() == ESP_OK) {
-        touch_start(usb_glue_touch);
+        touch_start(touch_route);
     } else {
         ESP_LOGW(TAG, "touch disabled");
     }
