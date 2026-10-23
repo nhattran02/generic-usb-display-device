@@ -30,11 +30,14 @@ static const char *TAG = "main";
 
 static const uint8_t s_formats[] = { GUD_PIXEL_FORMAT_RGB565 };
 
-/* No real video timings on an SPI panel; ~30 full frames/s is what 40 MHz SPI can push */
+/*
+ * No real video timings on an SPI panel. 60 Hz is what the host advertises to compositors; when they draw
+ * faster than USB + SPI can carry, the gud driver merges the damage, so nothing queues up.
+ */
 static struct gud_display_timings s_timings = {
     .hfront = 8, .hsync = 4, .hback = 8,
     .vfront = 8, .vsync = 4, .vback = 8,
-    .framerate = 30,
+    .framerate = 60,
 };
 
 static struct gud_display_edid s_edid = {
@@ -61,8 +64,10 @@ static struct gud_display_edid s_edid = {
 static int controller_enable(const struct gud_display *disp, uint8_t enable)
 {
     (void) disp;
-    if (!enable)
+    if (!enable) {
+        gud_driver_discard();               /* pictures still queued must not land on "<NO SIGNAL>" */
         screen_signal_lost();
+    }
     return 0;
 }
 
@@ -161,11 +166,23 @@ static int set_buffer(const struct gud_display *disp, const struct gud_set_buffe
     return 0;
 }
 
-/* A rectangle has landed in the shadow framebuffer: send it to the ILI9341 */
-static void write_buffer(const struct gud_display *disp, const struct gud_set_buffer_req *req, void *buf)
+/* Decoded rectangles are streamed straight to the ILI9341 (gud_driver.c render task) */
+static void rect_begin(const struct gud_display *disp, const struct gud_set_buffer_req *req)
 {
-    (void) disp; (void) buf;
-    lcd_flush(req->x, req->y, req->width, req->height);
+    (void) disp;
+    lcd_stream_begin(req->x, req->y, req->width, req->height);
+}
+
+static void rect_write(const struct gud_display *disp, const void *pixels, size_t len)
+{
+    (void) disp;
+    lcd_stream_write(pixels, len);
+}
+
+static void rect_end(const struct gud_display *disp)
+{
+    (void) disp;
+    lcd_stream_end();
 }
 
 static int display_enable(const struct gud_display *disp, uint8_t enable)
@@ -187,7 +204,9 @@ static struct gud_display s_display = {
     .controller_enable = controller_enable,
     .display_enable = display_enable,
     .set_buffer = set_buffer,
-    .write_buffer = write_buffer,
+    .rect_begin = rect_begin,
+    .rect_write = rect_write,
+    .rect_end = rect_end,
     .state_commit = state_commit,
 #if BOARD_BL_PWM_GPIO >= 0
     .connector_properties = s_connector_props,
@@ -200,23 +219,24 @@ void app_main(void)
     ESP_LOGI(TAG, "GUD display firmware starting");
 
     ESP_ERROR_CHECK(board_init());          /* I2C bus, backlight PWM (dark) */
-    ESP_ERROR_CHECK(lcd_init());            /* ILI9341 over SPI, PSRAM shadow framebuffer */
+    ESP_ERROR_CHECK(lcd_init());            /* ILI9341 over SPI, framebuffer for the firmware's own screens */
 #if BOARD_BL_PWM_GPIO >= 0
     bl_init();                              /* saved brightness, before the backlight first comes on */
 #endif
     screen_init();                          /* "<NO SIGNAL>" until the host sends a picture, sleep after 60 s */
 
-    /* Bulk data is written there at USB speed (~1 MB/s), so PSRAM is fine; LZ4 decoding goes through
-     * an internal-SRAM window so the framebuffer only sees sequential writes (see gud_driver.c) */
-    uint8_t *rx = heap_caps_malloc(FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *window = heap_caps_malloc(GUD_LZ4_WINDOW_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!rx || !window) {
+    /* Bulk data is written to the receive buffers at USB speed (~1 MB/s), so PSRAM is fine; LZ4 back-references
+     * are served from an internal-SRAM window (see gud_driver.c) */
+    void *rx[GUD_RX_BUFS];
+    for (int i = 0; i < GUD_RX_BUFS; i++)
+        rx[i] = heap_caps_malloc(FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *window = heap_caps_malloc(GUD_LZ4_WINDOW_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!rx[0] || !rx[1] || !window) {
         ESP_LOGE(TAG, "out of memory for GUD buffers");
         abort();
     }
-
-    s_display.fb = lcd_framebuffer();
-    gud_driver_setup(&s_display, rx, FB_BYTES, window);
+    /* Render task on core 0, next to nothing busy; the USB stack runs on core 1 */
+    ESP_ERROR_CHECK(gud_driver_setup(&s_display, rx, FB_BYTES, window, 0));
 
     if (touch_init() == ESP_OK) {
         touch_start(usb_glue_touch);
@@ -225,5 +245,6 @@ void app_main(void)
     }
 
     usb_glue_start();                       /* USB task + ISR on core 1 */
-    ESP_LOGI(TAG, "ready; free PSRAM %u", (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "ready; free internal %u, PSRAM %u", (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }

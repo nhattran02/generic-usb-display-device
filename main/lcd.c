@@ -1,9 +1,13 @@
 /*
  * ILI9341V over 4-wire SPI (esp_lcd panel IO only; the few MIPI DCS commands are sent by hand).
  *
- * The host writes rectangles into a PSRAM shadow framebuffer; lcd_flush() then copies them row band by
- * row band into two DMA bounce buffers in internal SRAM, swapping RGB565 to the panel's big-endian byte
- * order on the way. While one band is on the wire the next one is being filled.
+ * Pixels are streamed: lcd_stream_write() swaps RGB565 to the panel's big-endian byte order into one of
+ * two DMA bounce buffers in internal SRAM; a full buffer is queued and the caller goes on filling the other
+ * one while it is on the wire. The first transfer of a rectangle is RAMWR, the following ones RAMWRC, so
+ * the panel doesn't depend on CS staying low between transfers.
+ *
+ * Buffer reuse needs no completion callback: queuing a transfer with a command waits for the transfers
+ * already queued, so once buffer B has been queued, buffer A (queued before it) is free again.
  */
 #include <string.h>
 #include "lcd.h"
@@ -21,11 +25,11 @@
 static const char *TAG = "lcd";
 
 #define FB_BYTES        (BOARD_LCD_W * BOARD_LCD_H * 2)
-/* One bounce buffer = 16 full rows (10 KB); 2 of them */
-#define BOUNCE_PX       (BOARD_LCD_W * 16)
+/* 2 bounce buffers of 16 KB: 3.3 ms on the wire at 40 MHz each, so the fixed cost per transfer stays small */
+#define BOUNCE_BYTES    (16 * 1024)
+#define BOUNCE_PX       (BOUNCE_BYTES / 2)
 
 /* MIPI DCS / ILI9341 commands */
-#define CMD_NOP         0x00
 #define CMD_SWRESET     0x01
 #define CMD_SLPIN       0x10
 #define CMD_SLPOUT      0x11
@@ -38,6 +42,7 @@ static const char *TAG = "lcd";
 #define CMD_RAMWR       0x2C
 #define CMD_MADCTL      0x36
 #define CMD_COLMOD      0x3A
+#define CMD_RAMWRC      0x3C    /* write memory continue */
 
 #define MADCTL_MY       0x80
 #define MADCTL_MX       0x40
@@ -46,8 +51,13 @@ static const char *TAG = "lcd";
 
 static esp_lcd_panel_io_handle_t s_io;
 static uint8_t *s_fb;
-static uint16_t *s_bounce[2];
 static SemaphoreHandle_t s_lock;
+
+/* stream state, owned by the lock holder */
+static uint16_t *s_bounce[2];
+static int s_cur;               /* buffer being filled */
+static size_t s_fill;           /* pixels in it */
+static bool s_first;            /* the next transfer opens the rectangle (RAMWR) */
 
 typedef struct {
     uint8_t cmd;
@@ -100,8 +110,8 @@ esp_err_t lcd_init(void)
 
     s_fb = heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     for (int i = 0; i < 2; i++)
-        s_bounce[i] = heap_caps_malloc(BOUNCE_PX * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_fb && s_bounce[0] && s_bounce[1], ESP_ERR_NO_MEM, TAG, "out of memory");
+        s_bounce[i] = heap_caps_malloc(BOUNCE_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_RETURN_ON_FALSE(s_lock && s_fb && s_bounce[0] && s_bounce[1], ESP_ERR_NO_MEM, TAG, "out of memory");
 
     const spi_bus_config_t bus = {
         .sclk_io_num = BOARD_LCD_SCK,
@@ -109,7 +119,7 @@ esp_err_t lcd_init(void)
         .miso_io_num = BOARD_LCD_MISO,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = BOUNCE_PX * 2,
+        .max_transfer_sz = BOUNCE_BYTES,
     };
     ESP_RETURN_ON_ERROR(spi_bus_initialize(BOARD_LCD_SPI_HOST, &bus, SPI_DMA_CH_AUTO), TAG, "SPI bus");
 
@@ -143,20 +153,92 @@ esp_err_t lcd_init(void)
     vTaskDelay(pdMS_TO_TICKS(120));
     tx(CMD_DISPON, NULL, 0);
 
-    ESP_LOGI(TAG, "ILI9341 %ux%u (rotation %d) @ %d MHz, framebuffer %p", BOARD_LCD_W, BOARD_LCD_H,
+    ESP_LOGI(TAG, "ILI9341 %ux%u (rotation %d), SPI %d MHz, framebuffer %p", BOARD_LCD_W, BOARD_LCD_H,
              BOARD_LCD_ROTATION, BOARD_LCD_SPI_HZ / 1000000, s_fb);
     return ESP_OK;
 }
 
 uint8_t *lcd_framebuffer(void) { return s_fb; }
 
-static void set_window(unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+/* ------------------------------ streaming ------------------------------ */
+
+/* Queue the filled bounce buffer and switch to the other one (which is free once this returns) */
+static void stream_send(void)
 {
-    uint8_t c[4] = { (uint8_t) (x0 >> 8), (uint8_t) x0, (uint8_t) (x1 >> 8), (uint8_t) x1 };
-    uint8_t r[4] = { (uint8_t) (y0 >> 8), (uint8_t) y0, (uint8_t) (y1 >> 8), (uint8_t) y1 };
-    tx(CMD_CASET, c, 4);
-    tx(CMD_RASET, r, 4);
+    if (!s_fill)
+        return;
+    esp_lcd_panel_io_tx_color(s_io, s_first ? CMD_RAMWR : CMD_RAMWRC, s_bounce[s_cur], s_fill * 2);
+    s_first = false;
+    s_cur ^= 1;
+    s_fill = 0;
 }
+
+/* Copy n pixels, swapping the bytes of each one (little endian host -> big endian panel) */
+static void swap_copy(uint16_t *dst, const uint16_t *src, size_t n)
+{
+    if (n && (((uintptr_t) dst ^ (uintptr_t) src) & 2) == 0) {
+        if ((uintptr_t) dst & 2) {
+            *dst++ = __builtin_bswap16(*src++);
+            n--;
+        }
+        uint32_t *d = (uint32_t *) dst;
+        const uint32_t *s = (const uint32_t *) src;
+        for (; n >= 8; n -= 8, d += 4, s += 4) {
+            uint32_t a = s[0], b = s[1], c = s[2], e = s[3];
+            d[0] = ((a & 0x00FF00FF) << 8) | ((a >> 8) & 0x00FF00FF);
+            d[1] = ((b & 0x00FF00FF) << 8) | ((b >> 8) & 0x00FF00FF);
+            d[2] = ((c & 0x00FF00FF) << 8) | ((c >> 8) & 0x00FF00FF);
+            d[3] = ((e & 0x00FF00FF) << 8) | ((e >> 8) & 0x00FF00FF);
+        }
+        for (; n >= 2; n -= 2, d++, s++) {
+            uint32_t a = *s;
+            *d = ((a & 0x00FF00FF) << 8) | ((a >> 8) & 0x00FF00FF);
+        }
+        dst = (uint16_t *) d;
+        src = (const uint16_t *) s;
+    }
+    while (n--)
+        *dst++ = __builtin_bswap16(*src++);
+}
+
+void lcd_stream_begin(unsigned x, unsigned y, unsigned w, unsigned h)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    unsigned x1 = x + w - 1, y1 = y + h - 1;
+    uint8_t c[4] = { (uint8_t) (x >> 8), (uint8_t) x, (uint8_t) (x1 >> 8), (uint8_t) x1 };
+    uint8_t r[4] = { (uint8_t) (y >> 8), (uint8_t) y, (uint8_t) (y1 >> 8), (uint8_t) y1 };
+    tx(CMD_CASET, c, 4);                    /* waits for the previous rectangle's last transfer */
+    tx(CMD_RASET, r, 4);
+    s_first = true;
+    s_fill = 0;
+}
+
+void lcd_stream_write(const void *pixels, size_t bytes)
+{
+    const uint16_t *p = pixels;
+    size_t n = bytes / 2;
+
+    while (n) {
+        size_t c = BOUNCE_PX - s_fill;
+        if (c > n)
+            c = n;
+        swap_copy(s_bounce[s_cur] + s_fill, p, c);
+        s_fill += c;
+        p += c;
+        n -= c;
+        if (s_fill == BOUNCE_PX)
+            stream_send();
+    }
+}
+
+void lcd_stream_end(void)
+{
+    stream_send();
+    xSemaphoreGive(s_lock);
+}
+
+/* ---------------------------- framebuffer ------------------------------ */
 
 void lcd_flush(unsigned x, unsigned y, unsigned w, unsigned h)
 {
@@ -165,27 +247,14 @@ void lcd_flush(unsigned x, unsigned y, unsigned w, unsigned h)
     if (x + w > BOARD_LCD_W) w = BOARD_LCD_W - x;
     if (y + h > BOARD_LCD_H) h = BOARD_LCD_H - y;
 
-    const unsigned band = BOUNCE_PX / w;    /* rows per bounce buffer, >= 1 */
-    int cur = 0;
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (unsigned row = y; row < y + h; row += band, cur ^= 1) {
-        unsigned n = (y + h - row) < band ? (y + h - row) : band;
-        uint16_t *dst = s_bounce[cur];
-
-        /* Filling this buffer overlaps with the other one being sent: every tx below first waits for
-         * the queued colour transfer, so the buffer filled two bands ago is free again here */
-        for (unsigned r = 0; r < n; r++) {
-            const uint16_t *src = (const uint16_t *) s_fb + (size_t) (row + r) * BOARD_LCD_W + x;
-            for (unsigned i = 0; i < w; i++)
-                *dst++ = __builtin_bswap16(src[i]);
-        }
-
-        set_window(x, row, x + w - 1, row + n - 1);
-        esp_lcd_panel_io_tx_color(s_io, CMD_RAMWR, s_bounce[cur], (size_t) w * n * 2);
+    lcd_stream_begin(x, y, w, h);
+    if (x == 0 && w == BOARD_LCD_W) {
+        lcd_stream_write(s_fb + (size_t) y * BOARD_LCD_W * 2, (size_t) w * h * 2);
+    } else {
+        for (unsigned row = y; row < y + h; row++)
+            lcd_stream_write(s_fb + ((size_t) row * BOARD_LCD_W + x) * 2, (size_t) w * 2);
     }
-    tx(CMD_NOP, NULL, 0);                   /* waits for the last band: the buffers are free on return */
-    xSemaphoreGive(s_lock);
+    lcd_stream_end();
 }
 
 void lcd_flush_all(void)

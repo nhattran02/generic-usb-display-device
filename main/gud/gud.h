@@ -404,18 +404,20 @@ struct gud_display {
 
 	int (*state_commit)(const struct gud_display *disp, const struct gud_state_req *state, uint8_t num_properties);
 	int (*set_buffer)(const struct gud_display *disp, const struct gud_set_buffer_req *set_buf);
-	/* Called after a rectangle has been copied into ->fb (may be NULL) */
-	void (*write_buffer)(const struct gud_display *disp, const struct gud_set_buffer_req *set_buf, void *buf);
 
-	/* ESP32 port: RGB565 framebuffer of the panel (width * height * 2 bytes).
-	 * Rectangles are received straight into it when they span the full width. */
-	uint8_t *fb;
+	/*
+	 * ESP32 port: pixel sink. A received rectangle is decoded in a render task and handed over as
+	 * rect_begin(), rect_write() with consecutive runs of its RGB565 (little endian, row-major) pixels,
+	 * each an even number of bytes, then rect_end().
+	 */
+	void (*rect_begin)(const struct gud_display *disp, const struct gud_set_buffer_req *set_buf);
+	void (*rect_write)(const struct gud_display *disp, const void *pixels, size_t len);
+	void (*rect_end)(const struct gud_display *disp);
 };
 
 uint32_t gud_get_buffer_length(uint8_t format, uint32_t width, uint32_t height);
 int gud_req_get(const struct gud_display *disp, uint8_t request, uint16_t index, void *data, size_t size);
 int gud_req_set(const struct gud_display *disp, uint8_t request, uint16_t index, const void *data, size_t size);
-void gud_write_buffer(const struct gud_display *disp, void *buf);
 uint8_t gud_current_format(void);
 
 #endif
