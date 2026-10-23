@@ -1,0 +1,4 @@
+## Fetched by the ESP-IDF component manager on the first build (into managed_components/)
+dependencies:
+  idf: ">=5.3"
+  lvgl/lvgl: "~9.2.2"
