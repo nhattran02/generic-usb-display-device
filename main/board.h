@@ -46,7 +46,7 @@
 
 /* Panel colour quirks: if red and blue are swapped flip BGR, if the picture looks like a negative flip INVERT */
 #define BOARD_LCD_BGR        1
-#define BOARD_LCD_INVERT     0
+#define BOARD_LCD_INVERT     1     /* the ES3C28P panel needs INVON (verified: video showed as a negative) */
 
 /* Active area of the 2.8" panel, mm (portrait) */
 #define BOARD_PANEL_W_MM     43
