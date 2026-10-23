@@ -12,17 +12,20 @@
 <table align="center">
   <tr>
     <td><img src="docs/images/photo-colorbars.jpg" width="380" alt="Colour bars drawn by tools/gud_test"></td>
-    <td><img src="docs/images/photo-nosignal.jpg" width="380" alt="The NO SIGNAL screen shown before the host draws"></td>
+    <td><img src="docs/images/standalone-monitor.png" width="380" alt="The standalone UI running on the board with no host"></td>
   </tr>
   <tr>
     <td align="center"><sub>Colour bars from <code>tools/gud_test</code></sub></td>
-    <td align="center"><sub>Waiting for the host</sub></td>
+    <td align="center"><sub>No host: the board runs its own touch UI</sub></td>
   </tr>
 </table>
 
 Turns the **LCDWiki ES3C28P** (2.8" ESP32-S3 board) into a plug-and-play USB touchscreen for Linux.
 Plug it in, and the kernel sees a normal display (`gud` driver) and a normal touchscreen
 (`hid-multitouch`). No custom host driver, no daemon.
+
+Unplugged from a host, it isn't a dead screen: the board runs its own touch UI (LVGL), and hands
+the panel to the host the moment the host starts drawing.
 
 Port of [Ponywka/gud-esp32s3](https://github.com/Ponywka/gud-esp32s3), which does the same for a
 Waveshare 4.3" RGB board. Here the panel is an SPI ILI9341, so the whole drawing path is rewritten.
@@ -75,9 +78,30 @@ v2 runs them in parallel (see below).
 - Touch is polled every 5 ms and sent as a standard HID multitouch report, already rotated to match
   the picture.
 
+## Standalone mode
+
+| Home | Monitor | Touch | Settings |
+|---|---|---|---|
+| ![Home](docs/images/standalone-home.png) | ![Monitor](docs/images/standalone-monitor.png) | ![Touch](docs/images/standalone-touch.png) | ![Settings](docs/images/standalone-settings.png) |
+
+While no host is drawing, the firmware shows its own UI, built with LVGL 9.2:
+
+- **Home**: connection state, chip temperature, uptime, free memory.
+- **Monitor**: a bedside-monitor demo (simulated ECG, pleth, respiration and vitals).
+- **Touch**: crosshair, coordinates, ripples and a fading trail under the finger.
+- **Settings**: backlight brightness and screen timeout (both saved on the board), waveform speed.
+
+The first picture from the host takes the panel over (the UI finishes its frame and pauses, touch goes
+to the host); when the host disconnects or unbinds the driver, the UI comes back. It only redraws what
+changes and streams it through the same DMA path as the host's pictures: the Monitor page keeps the
+SPI bus about 5 % busy, so it stays smooth. The screen sleeps after the timeout and a touch wakes it.
+
+`tools/ui_preview/build.sh` renders the UI on a PC (gcc or MinGW), for working on it without flashing.
+
 ## Build and flash
 
-You need ESP-IDF v6.1 (v5.3+ should work too).
+You need ESP-IDF v6.1 (v5.3+ should work too). The first build fetches LVGL through the component
+manager (network needed once).
 
 ```sh
 idf.py set-target esp32s3
@@ -106,8 +130,8 @@ ls /sys/class/drm | grep USB        # card1-USB-1
 Ubuntu 22.04+ and Armbian ship the `gud` module. Ubuntu 20.04 needs the HWE kernel
 (`linux-generic-hwe-20.04`, 5.15). Debian disables it; build it from [`host/gud-module`](host/gud-module).
 
-On first plug-in the screen shows `<NO SIGNAL>` and goes dark after 60 s if nothing is drawn.
-DPMS and the brightness slider work; brightness is saved on the board.
+The board switches from its own UI to the host's picture as soon as the host draws, and back when the
+host goes away. DPMS and the brightness slider work; brightness is saved on the board.
 
 ### Quick tests
 
@@ -164,11 +188,12 @@ Rotation and SPI clock can also be set at build time: `idf.py -DBOARD_LCD_ROTATI
 ## Project layout
 
 ```
-main/                    firmware: board, lcd (ILI9341), touch (FT6336G), usb_glue, screen/ui
+main/                    firmware: board, lcd (ILI9341), touch (FT6336G), usb_glue, screen, settings
 main/gud/                GUD protocol, USB class driver + render task, LZ4 decoder
+main/ui/                 standalone UI (LVGL): pages, waveform widget, port to lcd/touch
 components/tinyusb/      TinyUSB 0.21 (device, HID, DWC2 only)
 bootloader_components/   USB download window on every boot
-tools/                   gud_test, gud_bench, usb_flash.py, host tests (tools/test)
+tools/                   gud_test, gud_bench, usb_flash.py, host tests (tools/test), UI preview
 host/gud-module/         the Linux gud driver, for kernels that don't ship it
 docs/images/             the figures in this file
 ```
