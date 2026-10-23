@@ -1,0 +1,16 @@
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+build_log.txt
+host/gud-module/*.o
+host/gud-module/*.ko
+host/gud-module/*.mod
+host/gud-module/*.mod.c
+host/gud-module/.*.cmd
+host/gud-module/Module.symvers
+host/gud-module/modules.order
+__pycache__/
+*.bin
+sdkconfig.*.bak
