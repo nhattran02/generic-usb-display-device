@@ -262,6 +262,11 @@ static void run(const char *name)
             last = t;
         }
     }
+    if (is_video && !frames) {
+        fprintf(stderr, "video: no frame on stdin (%ux%u XRGB8888 expected); run the ffmpeg command without "
+                "2>/dev/null to see why\n", W, H);
+        return;
+    }
     usleep(200000);                                 /* let the last flush land */
     get_stats(&b);
     report(name, frames, now() - t0, &a, &b);
