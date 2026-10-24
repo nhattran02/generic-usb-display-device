@@ -20,6 +20,7 @@ static const char *TAG = "ui";
 #define DRAW_ROWS       24
 #define TASK_CORE       0
 #define TASK_PRIO       3       /* below the GUD render task: the host always wins */
+#define UI_STACK        12288
 
 static SemaphoreHandle_t s_parked, s_resume;
 static volatile bool s_active;
@@ -103,9 +104,41 @@ static void check_idle(void)
     }
 }
 
+/*
+ * LVGL setup, the first frame and the main loop all run here: rendering needs far more stack than
+ * app_main's default 3.5 KB (that overflowed on the first frame).
+ */
 static void ui_task(void *arg)
 {
-    (void) arg;
+    SemaphoreHandle_t ready = arg;
+
+    lv_init();
+    lv_tick_set_cb(tick_ms);
+
+    const size_t buf_bytes = (size_t) BOARD_LCD_W * DRAW_ROWS * 2;
+    void *buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG, "out of memory for LVGL draw buffers");
+        vTaskDelete(NULL);
+    }
+
+    lv_display_t *disp = lv_display_create(BOARD_LCD_W, BOARD_LCD_H);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_buffers(disp, buf1, buf2, (uint32_t) buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, flush_cb);
+
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, read_cb);
+
+    ui_app_create();
+    lv_refr_now(disp);              /* first frame on the panel before the backlight comes on */
+    s_last_touch_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "LVGL %d.%d.%d standalone UI up, free stack %u", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR,
+             LVGL_VERSION_PATCH, (unsigned) uxTaskGetStackHighWaterMark(NULL));
+    xSemaphoreGive(ready);
+
     for (;;) {
         if (!s_active) {
             xSemaphoreGive(s_parked);
@@ -142,34 +175,14 @@ esp_err_t ui_port_start(void)
 {
     s_parked = xSemaphoreCreateBinary();
     s_resume = xSemaphoreCreateBinary();
-    if (!s_parked || !s_resume)
+    SemaphoreHandle_t ready = xSemaphoreCreateBinary();
+    if (!s_parked || !s_resume || !ready)
         return ESP_ERR_NO_MEM;
 
-    lv_init();
-    lv_tick_set_cb(tick_ms);
-
-    const size_t buf_bytes = (size_t) BOARD_LCD_W * DRAW_ROWS * 2;
-    void *buf1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    void *buf2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!buf1 || !buf2)
-        return ESP_ERR_NO_MEM;
-
-    lv_display_t *disp = lv_display_create(BOARD_LCD_W, BOARD_LCD_H);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_buffers(disp, buf1, buf2, (uint32_t) buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    lv_display_set_flush_cb(disp, flush_cb);
-
-    lv_indev_t *indev = lv_indev_create();
-    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-    lv_indev_set_read_cb(indev, read_cb);
-
-    ui_app_create();
-    lv_refr_now(disp);              /* first frame on the panel before the backlight comes on */
-
-    s_last_touch_us = esp_timer_get_time();
     s_active = true;
-    if (xTaskCreatePinnedToCore(ui_task, "ui", 8192, NULL, TASK_PRIO, NULL, TASK_CORE) != pdPASS)
+    if (xTaskCreatePinnedToCore(ui_task, "ui", UI_STACK, ready, TASK_PRIO, NULL, TASK_CORE) != pdPASS)
         return ESP_ERR_NO_MEM;
-    ESP_LOGI(TAG, "LVGL %d.%d.%d standalone UI up", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
-    return ESP_OK;
+    /* wait for the first frame, so the caller can switch the backlight on over a finished picture */
+    /* (kept, not deleted: after a timeout the task may still give it) */
+    return xSemaphoreTake(ready, pdMS_TO_TICKS(3000)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
